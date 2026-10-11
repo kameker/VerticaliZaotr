@@ -181,9 +181,11 @@ input[type=range]{width:100%;accent-color:var(--accent)}
       <label>Масса мотора, кг<input type="number" step="0.1" min="0.2" data-mf="mass"></label>
     </div>
     <div class="hint" id="motorNote" style="margin:0 0 6px 104px"></div>
-    <label class="sl" style="grid-template-columns:96px 1fr">Пик контроллера <select id="peak" class="sel">
-      <option value="1">нет (только номинальный момент)</option><option value="1.5">×1,5 на 5 с</option>
-      <option value="2">×2 на 5 с</option><option value="2.5">×2,5 на 5 с</option><option value="3">×3 на 5 с</option></select></label>
+    <div class="mgrid">
+      <label>Ток мотора, макс. А<input type="number" id="motorAmps" step="0.25" min="1"></label>
+      <label>Ток батареи, макс. А<input type="number" id="batteryAmps" step="0.5" min="1"></label>
+    </div>
+    <div class="hint" style="margin:0 0 6px 0">Пределы контроллера: на каждый мотор и на всё кресло (BMS, предохранитель, провода). На малой скорости ток мотора больше тока батареи.</div>
     <div class="row" style="margin-top:6px"><button id="applyPerson" style="flex:1">Применить (кресло вернётся в исходное положение)</button></div>
   </section>
   <section class="card">
@@ -211,11 +213,13 @@ input[type=range]{width:100%;accent-color:var(--accent)}
     <div class="row wrap" style="margin-top:8px">
       <span style="color:var(--muted)">Перенести</span>
       <button data-goto="threshold">к порогу 30 мм</button>
+      <button data-goto="curb50">к бордюру 50 мм</button>
       <button data-goto="ramp">к пандусу 1:12</button>
       <button data-goto="platform">на спуск 1:8</button>
-      <button data-goto="hill10">к горке 10°</button>
-      <button data-goto="hill15">к горке 15°</button>
-      <button data-goto="hill30">к горке 30°</button>
+      <button data-goto="hill6">к уклону 6°</button>
+      <button data-goto="hill10">к уклону 10°</button>
+      <button data-goto="hill15">к уклону 15°</button>
+      <button data-goto="hill30">к уклону 30°</button>
       <button data-goto="start">на старт</button>
     </div>
     <div class="row" style="margin-top:8px"><button id="reset" style="flex:1">Сброс симуляции</button></div>
@@ -283,7 +287,7 @@ $('#reset').onclick = ()=> sendEvent({name:'reset'});
 const motorParams = ()=>{ const o={}; document.querySelectorAll('[data-mf]').forEach(i=>{ if(i.value!=='') o[i.dataset.mf]=+i.value; }); return o; };
 $('#applyPerson').onclick = ()=> sendEvent({name:'config', mass:+$('#mass').value, height:+$('#height').value/100,
                                                act:$('#act').value, frame:$('#frameMat').value,
-                                               motor:$('#motor').value, motor_params:motorParams(), peak:+$('#peak').value,
+                                               motor:$('#motor').value, motor_params:motorParams(), motor_amps:+$('#motorAmps').value, battery_amps:+$('#batteryAmps').value,
                                                chair:$('#chair').value});
 function motorSummary(m){
   const tw = m.T*m.ratio*m.eta, vr = m.n_rated/m.ratio*2*Math.PI/60*0.16, v0 = m.n0/m.ratio*2*Math.PI/60*0.16;
@@ -303,7 +307,7 @@ fetch('/api/options').then(r=>r.json()).then(o=>{ OPT=o;
   $('#act').onchange = ()=> $('#actNote').textContent = OPT.actuators[$('#act').value].note;
   $('#chair').innerHTML = Object.entries(o.chairs).map(([k,v])=>`<option value="${k}">${v}</option>`).join('');
   $('#motor').innerHTML = Object.entries(o.motors).map(([k,v])=>`<option value="${k}">${v.name}</option>`).join('');
-  $('#motor').onchange = showMotor;
+  $('#motor').onchange = ()=>{ showMotor(); const k = $('#motor').value; $('#motorAmps').value = k==='custom' ? (motorParams().I||'') : OPT.motors[k].I; };
   document.querySelectorAll('[data-mf]').forEach(i=> i.oninput = showMotor);
 }).catch(()=>{});
 let fastDrag = false;
@@ -349,9 +353,9 @@ const TILES = [
   ['seat','Угол сиденья', s=>fmt(s.seat_angle,1)+'°', s=>'0° сидя … 75° стоя', s=>s.seat_angle/75],
   ['stroke','Ход привода', s=>fmt(s.stroke*1000)+' мм', s=>fmt(s.stroke_speed*1000,1)+' мм/с из '+fmt(s.act_info.speed*1000), s=>s.stroke/0.3],
   ['lift','Усилие привода', s=>fmt(s.lift_force)+' Н', s=>'макс. '+fmt(s.act_info.force)+' Н · '+fmt(s.lift_power,1)+' Вт', s=>Math.abs(s.lift_force)/s.act_info.force],
-  ['tl','Момент колеса Л', s=>fmt(s.torque_left,1)+' Н·м', s=>'предел '+fmt(s.torque_limit[0],1)+' · '+fmt(s.rpm_left)+' об/мин · '+fmt(s.power_left)+' Вт', s=>Math.abs(s.torque_left)/s.motor_info.wheel_torque],
-  ['tr','Момент колеса П', s=>fmt(s.torque_right,1)+' Н·м', s=>'предел '+fmt(s.torque_limit[1],1)+' · '+fmt(s.rpm_right)+' об/мин · '+fmt(s.power_right)+' Вт', s=>Math.abs(s.torque_right)/s.motor_info.wheel_torque],
-  ['amp','Ток батареи', s=>fmt(s.battery_A,1)+' А', s=>'≈ '+fmt(s.battery_A*25.6)+' Вт · номинал моторов 2×'+fmt(s.motor_info.I,1)+' А', s=>s.battery_A/(2*s.motor_info.I*Math.max(1,s.peak))],
+  ['tl','Момент колеса Л', s=>fmt(s.torque_left,1)+' Н·м', s=>'предел '+fmt(s.torque_limit[0],1)+' · мотор '+fmt(s.motor_A_left,1)+' из '+fmt(s.motor_amps,1)+' А · '+fmt(s.rpm_left)+' об/мин', s=>Math.abs(s.torque_left)/s.motor_info.wheel_torque],
+  ['tr','Момент колеса П', s=>fmt(s.torque_right,1)+' Н·м', s=>'предел '+fmt(s.torque_limit[1],1)+' · мотор '+fmt(s.motor_A_right,1)+' из '+fmt(s.motor_amps,1)+' А · '+fmt(s.rpm_right)+' об/мин', s=>Math.abs(s.torque_right)/s.motor_info.wheel_torque],
+  ['amp','Ток батареи', s=>fmt(s.battery_A,1)+' А', s=>'≈ '+fmt(s.battery_A*25.6)+' Вт · предел '+fmt(s.battery_amps,1)+' А', s=>s.battery_A/s.battery_amps],
   ['bat','Заряд', s=>fmt(s.battery_pct,1)+' %', s=>'израсходовано '+fmt(s.energy_Wh,2)+' Вт·ч из 512', s=>s.battery_pct/100],
   ['mass','Масса кресла', s=>fmt(s.chair_mass,1)+' кг', s=>'с человеком '+fmt(s.total_mass,1)+' кг (рост '+fmt(s.height_set*100)+' см)'],
   ['com','Центр масс', s=>'h = '+fmt((s.com_display||s.com)[2]*1000)+' мм', s=>'от оси колёс: '+fmt((s.com_xy_display||s.com_xy)?(s.com_xy_display||s.com_xy)[0]*1000:null)+' мм вперёд'],
@@ -368,9 +372,9 @@ function render(s){
   const pk = s.mass_set + '/' + s.height_set;
   if(!fastDrag){ fs.value = Math.round(s.seat_angle); $('#fastSeatO').textContent = Math.round(s.seat_angle) + '°'; }
   const ai = s.act_info; $('#seatHint').innerHTML = `Держи кнопку (<span class="kbd">R</span> / <span class="kbd">F</span>). Привод ${ai.name}: полный ход 300 мм ≈ ${Math.round(0.3/ai.speed/0.9)} с. Чтобы не ждать, включи ускорение времени или ползунок ниже.`;
-  const ck = s.chair + '/' + s.act + '/' + s.frame_mat + '/' + s.motor_info.key + '/' + JSON.stringify(s.motor_params) + '/' + s.peak;
+  const ck = s.chair + '/' + s.act + '/' + s.frame_mat + '/' + s.motor_info.key + '/' + JSON.stringify(s.motor_params) + '/' + s.motor_amps + '/' + s.battery_amps;
   if(OPT && ck !== lastCfg){ lastCfg = ck; $('#act').value = s.act; $('#frameMat').value = s.frame_mat; $('#actNote').textContent = OPT.actuators[s.act].note;
-    $('#motor').value = s.motor_info.key; $('#chair').value = s.chair; $('#peak').value = String(s.peak);
+    $('#motor').value = s.motor_info.key; $('#chair').value = s.chair; $('#motorAmps').value = s.motor_amps; $('#batteryAmps').value = s.battery_amps;
     document.querySelectorAll('[data-mf]').forEach(i=> i.value = +(+s.motor_params[i.dataset.mf]).toFixed(3)); showMotor(); }
   if(pk !== lastPerson){ lastPerson = pk; $('#mass').value=s.mass_set; $('#massO').textContent=Math.round(s.mass_set)+' кг';
     $('#height').value=Math.round(s.height_set*100); $('#heightO').textContent=Math.round(s.height_set*100)+' см'; }
@@ -397,7 +401,7 @@ function render(s){
   $('#hLift').textContent = fmt(s.lift_force)+' Н';
   $('#hTip').textContent = fmt(s.lean_fwd,0)+'° / '+fmt(s.lean_back,0)+'°';
   const ws = s.cmd.estop ? ['АВАРИЙНЫЙ СТОП'].concat(s.warnings) : s.warnings;
-  $('#hudWarn').innerHTML = ws.slice(0,3).map(w=>`<div class="${/ОПРОКИН|оторвал|АВАРИЙ/.test(w)?'bad':''}">${w}</div>`).join('');
+  $('#hudWarn').innerHTML = ws.slice(0,3).map(w=>`<div class="${/ОПРОКИН|оторвал|АВАРИЙ|упёрлось|не удерживают/.test(w)?'bad':''}">${w}</div>`).join('');
 }
 
 // top view

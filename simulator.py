@@ -3,7 +3,7 @@
     python simulator.py              everything in one browser page (video + control panel)
     mjpython simulator.py --viewer   separate MuJoCo window + panel (old mode)
 
-The page (http://127.0.0.1:8765) shows the simulation video with the joystick, seat
+The page (http://127.0.0.1:8790) shows the simulation video with the joystick, seat
 up/down, brake, emergency stop, speed level, person/chair settings, floor slope, pushes,
 the test track, live telemetry and plots.
 """
@@ -18,24 +18,15 @@ HERE = pathlib.Path(__file__).resolve().parent
 MODEL = HERE / "chair_human.xml"
 PORT = 8790
 
-WHEELS = ["drive_left", "drive_right", "front_left", "front_right"]
+WHEELS = ["drive_left", "drive_right", "front_left", "front_right", "antitip_left", "antitip_right"]
 TRACK = 0.525                     # m, drive wheel track
 BATTERY_V, BATTERY_AH = 25.6, 20.0
-ETA_DRIVE = 0.8
-MOTOR_IDLE_A = 1.5                # A per motor when turning (datasheet no-load current)
+ETA_CTRL = 0.95                   # PWM motor controller efficiency
 LIFT_IDLE_A, ETA_LIFT = 1.25, 0.30
 LEVEL_FRACTIONS = [0.25, 0.42, 0.6, 0.8, 1.0]  # speed levels 1..5 as a share of the top speed
 TOP_SPEED_CAP = 1.67              # m/s = 6 km/h, usual limit for power wheelchairs
-PEAK_TIME = 5.0                   # s, how long the controller may give its peak current
-PEAK_RECOVERY = 0.25              # peak budget refills at 1/4 of real time below rated torque
 TURN_RATE = 1.6                   # rad/s at full joystick, scaled with level
-OBSTACLE_SPEED = 0.5 / 3.6        # m/s, automatic low-speed traction mode threshold
-OBSTACLE_STALL_TIME = 0.35        # s below 45% of command before traction mode starts
-OBSTACLE_TORQUE_MULT = 1        # short peak for quasi-static obstacle climbing
-OBSTACLE_KV = 1600.0              # strong low-speed velocity/current response
-ROAD_FRICTION, SKID_FRICTION = 0.5, 0.5
-SKID_YAW_GAIN = 180.0            # N*m per rad/s error; represents lateral track/tyre forces
-SKID_YAW_TORQUE = 250.0          # N*m cap for the simplified skid-steer contact model
+STALL_TIME = 1.0                  # s commanded to move but standing still -> "stuck" warning
 ACCEL, DECEL, EBRAKE_DECEL = 0.6, 1.0, 2.5   # m/s^2
 STANDING_SPEED = 0.35             # m/s, speed limit when the seat is raised > 5 deg
 
@@ -51,9 +42,7 @@ class Telemetry:
         jid = lambda n: mujoco.mj_name2id(m, J, n)
         self.frame = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "frame")
         self.free = m.jnt_type[m.body_jntadr[self.frame]] == mujoco.mjtJoint.mjJNT_FREE
-        self.dof = {n: m.jnt_dofadr[jid(n)] for n in
-                    ["drive_left_spin", "drive_right_spin", "front_left_spin", "front_right_spin",
-                     "actuator_extension"]}
+        self.dof = {n: m.jnt_dofadr[jid(n)] for n in ["drive_left_spin", "drive_right_spin", "actuator_extension"]}
         self.qadr = {n: m.jnt_qposadr[jid(n)] for n in ["lift_angle", "actuator_extension"]}
         self.hip_dof = m.jnt_dofadr[jid("hip")] if jid("hip") >= 0 else None
         self.wheel_geom = {}
@@ -62,9 +51,7 @@ class Telemetry:
             for w in WHEELS:
                 if n == f"{w}_contact":
                     self.wheel_geom[g] = w
-        ground_names = ["floor", "threshold_30mm", "ramp_up_1_12", "ramp_down_1_8", "platform"]
-        ground_names += [f"hill_{deg}_{part}" for deg in (10, 15, 30) for part in ("up", "top", "down")]
-        self.ground = [mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, n) for n in ground_names]
+        self.ground = [mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, n) for n in bh.GROUND_GEOMS]
         self.ground = [g for g in self.ground if g >= 0]
         self.foot_geoms = {mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, n) for n in ("h_foot_L", "h_foot_R")} - {-1}
         d0 = mujoco.MjData(m)
@@ -96,29 +83,17 @@ class Telemetry:
         t["roll"] = math.degrees(math.atan2(R[2, 1], R[2, 2]))
         pm = 0.0
         for side in ("left", "right"):
-            rear_dof = self.dof[f"drive_{side}_spin"]
-            front_dof = self.dof[f"front_{side}_spin"]
-            w, wf = float(d.qvel[rear_dof]), float(d.qvel[front_dof])
-            tau = float(d.qfrc_actuator[rear_dof])
-            tau_f = float(d.qfrc_actuator[front_dof])
+            dof = self.dof[f"drive_{side}_spin"]
+            w, tau = float(d.qvel[dof]), float(d.qfrc_actuator[dof])
             t[f"rpm_{side}"] = w * 60 / (2 * math.pi)
-            # Total side effort expressed as equivalent torque on the 320 mm rear wheel.
-            t[f"torque_{side}"] = tau + tau_f
-            t[f"power_{side}"] = tau * w + tau_f * wf
+            t[f"rim_speed_{side}"] = w * bh.WHEEL_R
+            t[f"torque_{side}"] = tau
+            t[f"power_{side}"] = tau * w
         t["seat_angle"] = math.degrees(d.qpos[self.qadr["lift_angle"]])
         t["stroke"] = float(d.qpos[self.qadr["actuator_extension"]])
         t["stroke_speed"] = float(d.qvel[self.dof["actuator_extension"]])
         t["lift_force"] = float(d.qfrc_actuator[self.dof["actuator_extension"]])
         t["lift_power"] = t["lift_force"] * t["stroke_speed"]
-        # battery current estimate
-        amps = 0.0
-        for side in ("left", "right"):
-            if abs(t[f"rpm_{side}"]) > 1:
-                amps += MOTOR_IDLE_A
-            amps += max(t[f"power_{side}"], 0) / ETA_DRIVE / BATTERY_V
-        if abs(t["stroke_speed"]) > 1e-4:
-            amps += max(LIFT_IDLE_A, max(t["lift_power"], 0) / ETA_LIFT / BATTERY_V)
-        t["battery_A"] = amps
         # contact loads
         gravity_dir = m.opt.gravity / np.linalg.norm(m.opt.gravity)
         loads = {w: 0.0 for w in WHEELS}
@@ -161,7 +136,7 @@ class Telemetry:
         # the chair really falls over only when the CoM passes them
         touching = {self.wheel_geom.get(c.geom1) for c in d.contact[:d.ncon]} | {self.wheel_geom.get(c.geom2) for c in d.contact[:d.ncon]}
         extra = [d.geom_xpos[gid] + float(m.geom_size[gid][0]) * g for gid, w in self.wheel_geom.items()
-                 if w.startswith(("antitip", "footroller")) and w not in touching]
+                 if w.startswith("antitip") and w not in touching]
         t["lean_fwd"], t["lean_back"] = t["tip_fwd"], t["tip_back"]
         if extra and len(pts) >= 3:
             st = self._stability(com, pts + extra, g, R, p0)
@@ -245,34 +220,35 @@ class Telemetry:
         return out
 
 
+def motor_electric(mp, wheel_torque, wheel_speed):
+    """Drive motor current (A) and the power it draws from the battery (W), from wheel torque and speed.
+    The PWM controller gives the motor only the voltage it needs (ke*w + R*i), so at low speed
+    a large motor current takes little battery current.  Braking (generating) takes nothing."""
+    w_m = abs(wheel_speed) * mp["ratio"]
+    i = abs(wheel_torque) / (mp["ratio"] * mp["eta"] * mp["kt"]) + (mp["I0"] if w_m > 1.0 else 0.0)
+    if wheel_torque * wheel_speed < 0:
+        return i, 0.0
+    return i, (mp["ke"] * w_m + mp["R"] * i) * i
+
+
 # ------------------------------------------------------------------------------ simulator
 class Sim:
     def __init__(self, mass, height, frame_mat=bh.DEFAULT_FRAME, act=bh.DEFAULT_ACTUATOR,
-                 motor=bh.DEFAULT_MOTOR, motor_params=None, peak=1.0, chair=bh.DEFAULT_CHAIR):
+                 motor=bh.DEFAULT_MOTOR, motor_params=None, motor_amps=None, battery_amps=bh.DEFAULT_BATTERY_AMPS,
+                 chair=bh.DEFAULT_CHAIR):
         self.lock = threading.Lock()
         self.chair = chair
         self.model_version = 0
         self.mass, self.height, self.frame_mat, self.act = mass, height, frame_mat, act
-        self.motor, self.motor_params, self.peak = motor, dict(motor_params or {}), float(peak)
+        self.motor, self.motor_params = motor, dict(motor_params or {})
         self.mp = bh.motor_profile(motor, self.motor_params)
-        self.peak_budget = [PEAK_TIME, PEAK_TIME]
+        self.motor_amps = float(motor_amps) if motor_amps else self.mp["I"]     # controller limit per motor
+        self.battery_amps = float(battery_amps)                                  # limit for the whole chair
         self.torque_limit = [self.mp["wheel_torque"]] * 2
+        self.limit_why = ["motor", "motor"]
+        self.w_hold = [0.0, 0.0]          # wheel speed with a 50 ms peak hold, for the battery limit
         self._write_model()
         self.m = mujoco.MjModel.from_xml_path(str(MODEL))
-        for wheel in WHEELS:
-            geom_name = f"{wheel}_contact"
-
-            gid = mujoco.mj_name2id(
-                self.m,
-                mujoco.mjtObj.mjOBJ_GEOM,
-                geom_name
-            )
-
-            if gid >= 0:
-                self.m.geom_solref[gid] = [0.03, 1.0]
-                self.m.geom_solimp[gid] = [
-                    0.8, 0.95, 0.001, 0.5, 2.0
-                ]
         self.d = mujoco.MjData(self.m)
         self.tel = Telemetry(self.m)
         self._ids()
@@ -300,29 +276,21 @@ class Sim:
         m = self.m
         A = lambda n: mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_ACTUATOR, n)
         self.a_lift = A("lift_actuator")
-        self.drive_acts = [[A("drive_left"), A("drive_front_left")],
-                           [A("drive_right"), A("drive_front_right")]]
-        self.brake_acts = [A(n) for n in ("brake_left", "brake_front_left",
-                                          "brake_right", "brake_front_right")]
-        self.wdofs = [[self.tel.dof["drive_left_spin"], self.tel.dof["front_left_spin"]],
-                      [self.tel.dof["drive_right_spin"], self.tel.dof["front_right_spin"]]]
+        self.drive_acts = [A("drive_left"), A("drive_right")]
+        self.brake_acts = [A("brake_left"), A("brake_right")]
+        self.wdofs = [self.tel.dof["drive_left_spin"], self.tel.dof["drive_right_spin"]]
         J = lambda n: m.jnt_qposadr[mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, n)]
-        self.wq = [J(n) for n in ("drive_left_spin", "front_left_spin",
-                                  "drive_right_spin", "front_right_spin")]
-        self.locks = [mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_EQUALITY, n) for n in
-                      ("brake_lock_left", "brake_lock_front_left",
-                       "brake_lock_right", "brake_lock_front_right")]
+        self.wq = [J("drive_left_spin"), J("drive_right_spin")]
+        self.locks = [mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_EQUALITY, n) for n in ("brake_lock_left", "brake_lock_right")]
         self.locked = False
         self.frame = self.tel.frame
         self.lift_act = m.actuator_actadr[self.a_lift]
         self.lift_gear = float(m.actuator_gear[self.a_lift, 0])
         self.lift_frange = m.actuator_forcerange[self.a_lift].copy()
         self.seat_pivot = m.body("seat").pos.copy()
-        self._body_vel = np.zeros(6)
-        self.drive_geoms = [mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, f"{w}_contact")
-                            for w in ("drive_left", "front_left", "drive_right", "front_right")]
 
-    def set_config(self, mass, height, frame_mat, act, motor=None, motor_params=None, peak=None, chair=None):
+    def set_config(self, mass, height, frame_mat, act, motor=None, motor_params=None, motor_amps=None,
+                   battery_amps=None, chair=None):
         """Rebuild person/frame/actuator/motor and copy the new numbers into the running model (same topology).
         A different chair design has a different layout: then the model is replaced."""
         self.mass, self.height, self.frame_mat, self.act = mass, height, frame_mat, act
@@ -333,10 +301,10 @@ class Sim:
             self.motor = motor
         if motor_params is not None:
             self.motor_params = {k: float(v) for k, v in motor_params.items() if k in bh.MOTOR_FIELDS and v not in ("", None)}
-        if peak is not None:
-            self.peak = float(peak)
         self.mp = bh.motor_profile(self.motor, self.motor_params)
-        self.peak_budget = [PEAK_TIME, PEAK_TIME]
+        self.motor_amps = float(motor_amps) if motor_amps else self.mp["I"]
+        if battery_amps:
+            self.battery_amps = float(battery_amps)
         self._write_model()
         m2 = mujoco.MjModel.from_xml_path(str(MODEL))
         if new_chair:
@@ -373,8 +341,7 @@ class Sim:
         self.locked = False
         self.fast_target = None
         self.v_cmd = self.w_cmd = 0.0
-        self.stall_time = self.recovered_time = 0.0
-        self.obstacle_mode = False
+        self.stall_time = self.runaway_time = 0.0
         self.history.clear()
         self.energy_Wh = 0.0
 
@@ -405,76 +372,58 @@ class Sim:
         # --- driving ---
         top = min(self.mp["v_rated"], TOP_SPEED_CAP)
         vmax = top * LEVEL_FRACTIONS[int(c["level"]) - 1]
-        if seat > 5:
-            vmax = min(vmax, STANDING_SPEED)
-            msg = "Сиденье поднято: скорость ограничена"
         jx, jy = float(c["jx"]), float(c["jy"])
         if abs(jx) < 0.08: jx = 0.0
         if abs(jy) < 0.08: jy = 0.0
+        seat_limited = seat > 5 and vmax > STANDING_SPEED and (jx or jy)
+        if seat > 5:
+            vmax = min(vmax, STANDING_SPEED)
+            msg = "Сиденье поднято: скорость ограничена"
         hard_stop = c["estop"] or c["brake"] or c["park"]
         v_t = 0.0 if hard_stop else jy * vmax
         w_t = 0.0 if hard_stop else -jx * TURN_RATE * (0.5 + 0.5 * vmax / top)
         acc = EBRAKE_DECEL if (c["brake"] or c["estop"]) else (ACCEL if abs(v_t) > abs(self.v_cmd) else DECEL)
         self.v_cmd += float(np.clip(v_t - self.v_cmd, -acc * dt, acc * dt))
         self.w_cmd += float(np.clip(w_t - self.w_cmd, -3 * dt, 3 * dt))
-        # Automatic obstacle mode: only for straight, deliberately slow travel.  It
-        # detects a stall, then supplies short-term current and longitudinal grip.
-        low_straight = (0.03 <= abs(v_t) <= OBSTACLE_SPEED * 1.05 and abs(w_t) < 0.08 and not hard_stop)
-        stalled = low_straight and speed < max(0.025, 0.45 * abs(v_t))
-        self.stall_time = self.stall_time + dt if stalled else max(0.0, self.stall_time - 2 * dt)
-        if self.stall_time >= OBSTACLE_STALL_TIME:
-            self.obstacle_mode = True
-        if self.obstacle_mode and low_straight and speed > 0.8 * abs(v_t):
-            self.recovered_time += dt
-        else:
-            self.recovered_time = 0.0
-        if not low_straight or self.recovered_time > 0.5:
-            self.obstacle_mode = False
-            self.stall_time = 0.0
-        tyre_mu = ROAD_FRICTION if self.obstacle_mode else SKID_FRICTION
-        m.geom_friction[self.drive_geoms, 0] = tyre_mu
-        drive_kv = OBSTACLE_KV if self.obstacle_mode else 400.0
-        for acts in self.drive_acts:
-            for a_id in acts:
-                m.actuator_gainprm[a_id, 0] = drive_kv
-                m.actuator_biasprm[a_id, 2] = -drive_kv
+        # stuck: commanded to drive straight on, but the chair stands still (obstacle, slope)
+        stalled = abs(self.v_cmd) > 0.05 and abs(self.w_cmd) < 0.3 and not hard_stop and speed < 0.25 * abs(self.v_cmd)
+        self.stall_time = self.stall_time + dt if stalled else 0.0
+        # runaway: rolling faster than commanded (downhill), the motors cannot hold the chair back
+        runaway = abs(t.get("speed", 0.0)) > abs(self.v_cmd) + 0.15 and not c["estop"]
+        self.runaway_time = self.runaway_time + dt if runaway else 0.0
         neutral = (v_t == 0 and w_t == 0 and abs(self.v_cmd) < 0.02 and abs(self.w_cmd) < 0.05)
         self.neutral_since = self.neutral_since + dt if neutral else 0.0
         em_brake = c["estop"] or c["park"] or self.neutral_since > 0.3
         if c["estop"]:
-            for acts in self.drive_acts:
-                d.ctrl[acts] = 0.0
+            d.ctrl[self.drive_acts] = 0.0
             self.v_cmd = self.w_cmd = 0.0
         else:
-            side_speed = (self.v_cmd - self.w_cmd * TRACK / 2,
-                          self.v_cmd + self.w_cmd * TRACK / 2)
-            for acts, target in zip(self.drive_acts, side_speed):
-                d.ctrl[acts] = target
+            # differential drive: left / right wheel rim speeds
+            d.ctrl[self.drive_acts] = (self.v_cmd - self.w_cmd * TRACK / 2, self.v_cmd + self.w_cmd * TRACK / 2)
         d.ctrl[self.brake_acts] = 1.0 if em_brake else 0.0
-        # --- motor torque limit: controller current (with peak) and back-EMF above rated speed ---
+        # --- motor torque limit: the smallest of three currents ---
+        #   controller limit per motor; battery limit (each motor gets half of the battery power:
+        #   (ke*w + R*i)*i = P, so at low speed a large motor current costs little battery current);
+        #   back-EMF: the full controller voltage cannot push more current at high speed
         mp = self.mp
-        for k, (acts, dofs) in enumerate(zip(self.drive_acts, self.wdofs)):
-            w = max(abs(d.qvel[dofs[0]]), abs(d.qvel[dofs[1]]))
-            requested_peak = max(self.peak, OBSTACLE_TORQUE_MULT if self.obstacle_mode else 1.0)
-            t_cur = mp["wheel_torque"] * (requested_peak if self.peak_budget[k] > 0 else 1.0)
-            motoring = abs(d.ctrl[acts[0]]) >= w * bh.WHEEL_R - 1e-3      # driving, not braking
-            if motoring and w > mp["w_rated"]:
-                t_emf = mp["wheel_torque"] * max(0.0, (mp["w0"] - w) / (mp["w0"] - mp["w_rated"]))
-                t_lim = min(t_cur, t_emf)
-            else:
-                t_lim = t_cur
+        p_share = self.battery_amps * BATTERY_V * ETA_CTRL / 2
+        for k, (a_id, dof) in enumerate(zip(self.drive_acts, self.wdofs)):
+            w = abs(d.qvel[dof])
+            # a slipping / bouncing wheel changes speed faster than the current loop reacts: hold the peak
+            self.w_hold[k] = max(w, self.w_hold[k] * math.exp(-dt / 0.05))
+            w_m = self.w_hold[k] * mp["ratio"]
+            motoring = abs(d.ctrl[a_id]) >= w * bh.WHEEL_R - 1e-3      # driving, not braking
+            i_lim, why = self.motor_amps, "motor"
+            if motoring:
+                b = mp["ke"] * w_m
+                i_bat = (-b + math.sqrt(b * b + 4 * mp["R"] * p_share)) / (2 * mp["R"])
+                i_emf = (bh.MOTOR_V - b) / mp["R"]
+                if i_bat < i_lim: i_lim, why = i_bat, "battery"
+                if i_emf < i_lim: i_lim, why = i_emf, "speed"
+            t_lim = max(i_lim - mp["I0"], 0.0) * mp["kt"] * mp["ratio"] * mp["eta"]
             t_lim = max(t_lim, 0.02 * mp["wheel_torque"])
-            self.torque_limit[k] = t_lim
-            # Split the motor's available longitudinal rim force equally between the
-            # identical front and rear wheels of each side.
-            half_rim_force = t_lim / (2 * bh.WHEEL_R)
-            for a_id in acts:
-                m.actuator_forcerange[a_id] = [-half_rim_force, half_rim_force]
-            used = abs(d.qfrc_actuator[dofs[0]]) + abs(d.qfrc_actuator[dofs[1]])
-            if used > mp["wheel_torque"] * 1.02:
-                self.peak_budget[k] = max(0.0, self.peak_budget[k] - dt)
-            else:
-                self.peak_budget[k] = min(PEAK_TIME, self.peak_budget[k] + PEAK_RECOVERY * dt)
+            self.torque_limit[k], self.limit_why[k] = t_lim, why
+            m.actuator_forcerange[a_id] = [-t_lim / bh.WHEEL_R, t_lim / bh.WHEEL_R]
         if em_brake != self.locked:                       # electromagnetic brake: lock / release
             for eq, q in zip(self.locks, self.wq):
                 m.eq_data[eq, 0] = d.qpos[q]
@@ -512,23 +461,12 @@ class Sim:
             msg = "АВАРИЙНЫЙ СТОП"
         elif c["park"]:
             msg = "Стояночный тормоз включён"
-        if self.obstacle_mode and not msg:
-            msg = "Тяговый режим: препятствие"
-        self.status = dict(em_brake=bool(em_brake), lift_dir=lift, vmax=vmax,
-                           obstacle_mode=self.obstacle_mode, msg=msg or self.msg)
-        # --- skid-steer yaw moment ---
-        # Four fixed point-contact wheels otherwise resist sideways scrub so strongly
-        # that opposing left/right wheel speeds cannot rotate the chassis.  This bounded
-        # moment represents the distributed lateral forces of tyres/tracks while the
-        # visible wheel actuators still provide longitudinal drive and consume power.
+        self.status = dict(em_brake=bool(em_brake), lift_dir=lift, vmax=vmax, seat_limited=bool(seat_limited),
+                           stuck=self.stall_time > STALL_TIME, runaway=self.runaway_time > 0.5, v_cmd=self.v_cmd,
+                           msg=msg or self.msg)
+        # --- pushes ---
         d.xfrc_applied[self.frame] = 0
         R = d.xmat[self.frame].reshape(3, 3)
-        mujoco.mj_objectVelocity(m, d, mujoco.mjtObj.mjOBJ_BODY, self.frame, self._body_vel, 0)
-        yaw_rate = float(np.dot(self._body_vel[:3], R[:, 2]))
-        yaw_torque = float(np.clip(SKID_YAW_GAIN * (self.w_cmd - yaw_rate),
-                                   -SKID_YAW_TORQUE, SKID_YAW_TORQUE))
-        d.xfrc_applied[self.frame, 3:] = R[:, 2] * yaw_torque
-        # --- pushes ---
         if self.push and d.time < self.push[0]:
             F = self.push[1]
             Fw = R @ F
@@ -546,10 +484,7 @@ class Sim:
                 self.push = (self.d.time + 0.3, F)
                 self.msg = f"Толчок {ev.get('force', 250)} Н на высоте 0,6 м"
             elif name == "goto":
-                spots = {"start": (0.0, 0.0), "threshold": (0.3, 0.0), "ramp": (3.8, 0.0),
-                         "platform": (7.15, 2.0 / 12), "hill10": (11.2, 0.0),
-                         "hill15": (19.2, 0.0), "hill30": (25.2, 0.0)}
-                x, z = spots[ev["where"]]
+                x, z = bh.TRACK_SPOTS[ev["where"]]
                 self.teleport(x, z=z)
                 self.msg = "Перенесено"
             elif name == "reset":
@@ -557,8 +492,8 @@ class Sim:
             elif name == "config":
                 self.set_config(float(ev.get("mass", self.mass)), float(ev.get("height", self.height)),
                                 ev.get("frame", self.frame_mat), ev.get("act", self.act),
-                                ev.get("motor", self.motor), ev.get("motor_params"), ev.get("peak"),
-                                ev.get("chair"))
+                                ev.get("motor", self.motor), ev.get("motor_params"), ev.get("motor_amps"),
+                                ev.get("battery_amps"), ev.get("chair"))
             elif name == "seat_fast":
                 th = math.radians(min(75.0, max(0.0, float(ev["angle"]))))
                 G = bh.geometry(self.chair)
@@ -573,9 +508,16 @@ class Sim:
         with self.lock:
             self.handle_events()
             n = max(1, int(round(frame_dt * self.cmd["timescale"] / self.m.opt.timestep)))
+            drive_amps, steps = 0.0, 0
             for _ in range(n):
                 self.apply_controls(self.m.opt.timestep)
+                w_pre = [float(self.d.qvel[dof]) for dof in self.wdofs]
                 mujoco.mj_step(self.m, self.d)
+                # battery current of this step: torque applied during the step at the speed the controller saw
+                # (a free wheel can spin up a lot within one step); averaged over the frame like an ammeter
+                drive_amps += sum(motor_electric(self.mp, float(self.d.qfrc_actuator[dof]), w)[1]
+                                  for dof, w in zip(self.wdofs, w_pre)) / (BATTERY_V * ETA_CTRL)
+                steps += 1
                 self.energy_Wh += self.state.get("battery_A", 0) * BATTERY_V * self.m.opt.timestep / 3600
                 if not np.isfinite(self.d.qpos).all():
                     self.reset(); self.msg = "Симуляция разошлась, сброс"
@@ -583,22 +525,17 @@ class Sim:
             t = self.tel.compute(self.d)
             t.update(self.status)
             mp = self.mp
-            amps = 0.0
+            amps = drive_amps / max(steps, 1)
             for side in ("left", "right"):
-                tw, rpm = t[f"torque_{side}"], t[f"rpm_{side}"]
-                motoring = tw * rpm > 0
-                if abs(rpm) > 1:
-                    amps += mp["I0"]
-                if motoring:
-                    amps += abs(tw) / (mp["ratio"] * mp["eta"]) / mp["kt"]
+                t[f"motor_A_{side}"] = motor_electric(mp, t[f"torque_{side}"], t[f"rpm_{side}"] * 2 * math.pi / 60)[0]
             if abs(t["stroke_speed"]) > 1e-4:
                 amps += max(LIFT_IDLE_A, max(t["lift_power"], 0) / ETA_LIFT / BATTERY_V)
             t["battery_A"] = amps
             t["motor_info"] = {k: mp[k] for k in ("name", "note", "wheel_torque", "v_rated", "v0", "I", "mass", "key")}
             t["motor_params"] = {k: mp[k] for k in bh.MOTOR_FIELDS}
-            t["peak"] = self.peak
+            t["motor_amps"], t["battery_amps"] = self.motor_amps, self.battery_amps
             t["torque_limit"] = list(self.torque_limit)
-            t["peak_budget"] = list(self.peak_budget)
+            t["limit_why"] = list(self.limit_why)
             t["time"] = self.d.time
             t["energy_Wh"] = self.energy_Wh
             t["battery_pct"] = max(0.0, 100 - 100 * self.energy_Wh / (BATTERY_V * BATTERY_AH))
@@ -633,22 +570,40 @@ class Sim:
                                                      for k, s_ in enumerate(("left", "right")))
         if not sat:
             self.sat_since = self.d.time
-        if self.d.time - self.sat_since > 1.5:     # at the limit for 1.5 s (normal starts are shorter)
-            w.append(f"Моторы на пределе момента ({self.mp['wheel_torque']:.1f} Н·м на колесе)")
-        if self.peak > 1 and min(self.peak_budget) <= 0:
-            w.append("Пиковый ток исчерпан, моторы перегреты — только номинальный момент")
+        if self.status["stuck"]:
+            rim = max(abs(t["rim_speed_left"]), abs(t["rim_speed_right"]))
+            hung = max(t["load_drive_left"], t["load_drive_right"]) < 1.0
+            if hung and max(t["load_antitip_left"], t["load_antitip_right"]) > 1.0:
+                w.append("Кресло упёрлось: село на антиопрокидыватели, ведущие колёса в воздухе")
+            elif rim > 0.5 * abs(self.status["v_cmd"]):
+                w.append("Кресло упёрлось: ведущие колёса буксуют, не хватает сцепления")
+            else:
+                w.append(f"Кресло упёрлось: моторам не хватает момента ({self._limit_text()})")
+        elif self.d.time - self.sat_since > 1.5:     # at the limit for 1.5 s (normal starts are shorter)
+            w.append(f"Моторы на пределе момента ({self._limit_text()})")
+        if self.status["runaway"]:
+            w.append(f"Моторы не удерживают кресло на спуске: {abs(t['speed']):.2f} м/с при заданных "
+                     f"{abs(self.status['v_cmd']):.2f} — резкая остановка может опрокинуть")
+        if self.status["seat_limited"]:
+            w.append(f"Сиденье поднято ({t['seat_angle']:.0f}°): скорость не выше {STANDING_SPEED:.2f} м/с — опусти сиденье (F)")
         Fmax = bh.ACTUATORS[self.act]["force"]
         if abs(t["lift_force"]) > Fmax * 0.95 and self.fast_target is None:
             w.append(f"Привод подъёма перегружен ({Fmax:.0f} Н)")
         for k, name in (("tip_fwd", "вперёд"), ("tip_back", "назад"), ("tip_side", "вбок")):
             if t[k] is not None and t[k] < 6:
                 w.append(f"Запас до опрокидывания {name} меньше 6°")
-        for k, name, sup in (("lean_fwd", "вперёд", "ролики подножки"), ("lean_back", "назад", "антиопрокидыватели")):
+        for k, name, sup in (("lean_back", "назад", "антиопрокидыватели"),):
             if t.get(k) is not None and t[k] < 4 and (t[k.replace("lean", "tip")] or 0) >= 6:
                 w.append(f"Кресло вот-вот ляжет {name} на {sup}")
         if abs(t["pitch"]) > 25 or abs(t["roll"]) > 25:
             w.append("КРЕСЛО ОПРОКИНУЛОСЬ")
         return w
+
+    def _limit_text(self):
+        k = int(np.argmax(self.torque_limit))
+        why = {"motor": f"ток мотора {self.motor_amps:g} А", "battery": f"ток батареи {self.battery_amps:g} А",
+               "speed": "обороты мотора"}[self.limit_why[k]]
+        return f"{self.torque_limit[k]:.1f} Н·м на колесе, ограничивает {why}"
 
     def snapshot(self):
         with self.lock:

@@ -1,13 +1,13 @@
 """V6: standing power wheelchair modelled after the ESLEH Rester (esleh.com), built from primitives.
 
 Dimensions from the ESLEH datasheet: width 61 cm, height 107 cm, seat 46 x 44 cm, seat height 58 cm,
-back height 48 cm, track 52.5 cm and standing angle 75 deg.  This simulator variant uses four equal
-320 mm driven wheels instead of the original 200 mm front wheels.
+back height 48 cm, track 52.5 cm and standing angle 75 deg.  Rear-wheel drive with 320 mm wheels and
+200 mm swivel casters in front, as on the original.
 Layout from the product photos: two blue side tubes with cross tubes, motors along the chair on
 right-angle gearboxes in front of the rear axle, battery bag with a luggage rack behind the backrest,
 actuator leaning forward from the rear of the base to the middle of the seat, thick seat cushion with
 grey lateral hip pads, mesh backrest with push handles, armrests (joystick on the right), legrest
-with a shin pad and a one-piece footplate with no auxiliary rollers.
+with a shin pad and a one-piece footplate; rear anti-tip wheels.
 
 The seat pivot sits at the front of the seat at knee height on two posts; the backrest is kept
 vertical by a parallelogram (lower link). Body, joint and site names match the CAD-based model so the
@@ -32,9 +32,11 @@ GEOM = dict(
     FRAME_PIN=(0.24, 0.09),          # actuator pin on a bracket of the rear-lower cross tube
 )
 WHEEL_TRACK = 0.525
-FRONT_X, FRONT_Y = 0.70, WHEEL_TRACK / 2   # front axle, same track and wheels as at the rear
-HEAD_X = FRONT_X + 0.045             # caster head tubes / front cross tube
-FOOTROLLER_R, FOOTROLLER_GAP = 0.028, 0.035   # rollers clear a 30 mm threshold
+FRONT_X, FRONT_Y = 0.90, WHEEL_TRACK / 2   # caster axles (trailing), same track as the drive wheels;
+                                     # 20 cm ahead of ESLEH: less weight on the casters, they climb a 30 mm threshold
+CASTER_R, CASTER_HW, CASTER_KG = 0.10, 0.025, 1.0   # 200 x 50 mm caster wheel
+HEAD_X = FRONT_X + 0.045             # caster head tubes (swivel axes) at the front ends of the side tubes
+LEGREST_X = 0.745                    # legrest hangs from the side tubes here, independent of the caster position
 
 BLUE = "0.13 0.22 0.58 1"
 BLACK = "0.07 0.07 0.08 1"
@@ -103,6 +105,7 @@ def base_tree(frame_mat="steel", motor_mass=1.7, act_mass=4.0):
     T.poly([(0.0, 0.205, 0.22), (0.30, 0.21, 0.17), (HEAD_X, 0.22, 0.21)], 32, mirror=True)   # lower bent tubes
     T.add((-0.11, 0.21, 0.36), (0.0, 0.205, 0.22), 32, mirror=True)                  # rear uprights
     T.add((HEAD_X, 0.22, 0.20), (HEAD_X, 0.22, 0.345), 38, rgba=BLUE, mirror=True)     # caster head tubes
+    T.add((HEAD_X, 0.22, 0.215), (HEAD_X, FRONT_Y, 0.215), 25, rgba=BLUE, mirror=True)  # brackets out to the caster stems
     T.add((-0.14, -0.21, 0.37), (-0.14, 0.21, 0.37), 25)                             # rear cross tube
     T.add((0.0, -0.205, 0.22), (0.0, 0.205, 0.22), 25)                               # motor cross tube
     T.add((0.30, -0.21, 0.17), (0.30, 0.21, 0.17), 25)                               # middle low cross tube
@@ -126,7 +129,8 @@ def base_tree(frame_mat="steel", motor_mass=1.7, act_mass=4.0):
         for s_ in (1, -1):
             ET.SubElement(fr, "geom", type="cylinder", size="0.012", fromto=f(px, s_ * 0.235, z_, px, s_ * 0.295, z_),
                           rgba=SILVER, **VIS)
-    # Rear anti-tip mounting arms removed.
+    # anti-tip ("anti-reverse") arms at the rear
+    T.add((-0.11, 0.18, 0.30), (-0.20, 0.17, 0.08), 20, rgba=BLACK, mirror=True)
     # luggage rack around the battery bag
     xa, xb, yr, zt = -0.15, 0.14, 0.16, 0.585
     T.poly([(xa, yr, zt), (xb, yr, zt)], 16, rgba=BLACK, mirror=True)
@@ -254,7 +258,8 @@ def base_tree(frame_mat="steel", motor_mass=1.7, act_mass=4.0):
                       rgba=SILVER, **VIS)
     for side, s in (("left", 1), ("right", -1)):
         wheel(f"drive_{side}", (0, s * WHEEL_TRACK / 2, 0.16), 0.16, 0.0425, 3.0, 0.105)
-        wheel(f"front_{side}", (FRONT_X, s * FRONT_Y, 0.16), 0.16, 0.0425, 3.0, 0.105)
+        wheel(f"front_{side}", (FRONT_X, s * FRONT_Y, CASTER_R), CASTER_R, CASTER_HW, CASTER_KG, 0.04)
+        wheel(f"antitip_{side}", (-0.20, s * 0.17, 0.04), 0.04, 0.012, 0.2, 0.025)
 
     ET.SubElement(root, "tendon")
     eq = ET.SubElement(root, "equality")
@@ -284,9 +289,9 @@ def fit_cushion(seat, dz):
 
 
 def add_legrest(root, frame, sole_z, heel_x, toe_x, knee, ankle, hw, r_sh, frame_mat="steel"):
-    """Legrest frame from the front cross tube, shin pad, one-piece footplate, no auxiliary rollers."""
+    """Legrest frame from the front cross tube, shin pad, one-piece footplate."""
     T = Tubes(frame)
-    top = (HEAD_X, 0.205, 0.33)
+    top = (LEGREST_X, 0.205, 0.33)
     bot = (heel_x + 0.03, 0.19, sole_z - 0.025)          # cross tube under the footplate, not under the heels
     T.add(top, bot, 22, rgba=BLACK, mirror=True)
     T.add((bot[0], -0.19, bot[2]), (bot[0], 0.19, bot[2]), 20, rgba=BLACK)
@@ -294,7 +299,7 @@ def add_legrest(root, frame, sole_z, heel_x, toe_x, knee, ankle, hw, r_sh, frame
     x0, x1 = heel_x - 0.07, toe_x + 0.03
     ET.SubElement(frame, "geom", name="footplate", type="box", pos=f((x0 + x1) / 2, 0, sole_z - 0.006),
                   size=f((x1 - x0) / 2, 0.19, 0.006), rgba="0.12 0.12 0.13 1", **VIS)
-    # Front footplate anti-tip rollers and their mounting struts removed.
+    # no anti-tip rollers under the footplate: with the casters 0.9 m ahead they never touch (see bench)
     # shin pad in front of the shins (holds the legs when standing)
     k, a = np.asarray(knee, float), np.asarray(ankle, float)
     axis = (a - k) / np.linalg.norm(a - k)
@@ -311,7 +316,7 @@ def add_legrest(root, frame, sole_z, heel_x, toe_x, knee, ankle, hw, r_sh, frame
         T.add((c[0] + 0.03, s * (hw + 0.08), c[2]), (top[0] + (c[2] - top[2]) / (bot[2] - top[2]) * (bot[0] - top[0]),
                                                    s * 0.19, c[2]), 14, rgba=BLACK)
     rho = 7.85 if frame_mat == "steel" else 2.70
-    return T.mass(rho) + 1.2, ((x0 + x1) / 2, 0, sole_z)      # tubes + plate and pad (rollers removed)
+    return T.mass(rho) + 1.2, ((x0 + x1) / 2, 0, sole_z)      # tubes + plate and pad
 
 
 def finish_frame(frame, extra_parts):
